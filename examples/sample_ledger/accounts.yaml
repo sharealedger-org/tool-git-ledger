@@ -1,0 +1,34 @@
+- code: '1010'
+  name: Checking Account
+  type: Asset
+  description: Primary Operating Bank Account
+- code: '1020'
+  name: Reserve Savings Account
+  type: Asset
+- code: '2000'
+  name: Accounts Payable
+  type: Liability
+- code: '3000'
+  name: Opening Balance Equity
+  type: Equity
+- code: '4000'
+  name: Membership Dues
+  type: Revenue
+- code: '4100'
+  name: Contributions & Donations
+  type: Revenue
+- code: '5000'
+  name: Web Hosting & Infrastructure
+  type: Expense
+- code: '5010'
+  name: Domain Names & DNS
+  type: Expense
+- code: '5020'
+  name: Software & Subscriptions
+  type: Expense
+- code: '5200'
+  name: Filing & Regulatory Fees
+  type: Expense
+- code: '5400'
+  name: Bank & Merchant Processing Fees
+  type: Expense

@@ -1,0 +1,41 @@
+- id: tx-20260101-001
+  date: '2026-01-01'
+  description: Opening bank balance for 2026
+  entries:
+    - account: '1010'
+      debit: 2500.00
+      memo: Operating checking account opening balance
+    - account: '3000'
+      credit: 2500.00
+      memo: Initial equity
+
+- id: tx-20260115-002
+  date: '2026-01-15'
+  description: Member voluntary donation
+  entries:
+    - account: '1010'
+      debit: 500.00
+    - account: '4100'
+      credit: 500.00
+  reference: INV-2026-01
+
+- id: tx-20260201-003
+  date: '2026-02-01'
+  description: Annual domain registration & DNS hosting
+  entries:
+    - account: '5010'
+      debit: 35.00
+      memo: Namecheap sharealedger.org renewal
+    - account: '1010'
+      credit: 35.00
+  reference: REC-NC-88912
+
+- id: tx-20260215-004
+  date: '2026-02-15'
+  description: Arizona annual report corporate filing fee
+  entries:
+    - account: '5200'
+      debit: 45.00
+    - account: '1010'
+      credit: 45.00
+  reference: AZ-CORP-2026

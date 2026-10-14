@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "git-ledger"
+version = "0.1.0"
+description = "Git-native, plain-text accounting package for open communities and micro-organizations"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [
+    { name = "Sharealedger Community", email = "community@sharealedger.org" }
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Topic :: Office/Business :: Financial :: Accounting",
+]
+dependencies = [
+    "pyyaml>=6.0.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[project.scripts]
+git-ledger = "gitledger.cli:main"
+gitledger = "gitledger.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["gitledger*"]
