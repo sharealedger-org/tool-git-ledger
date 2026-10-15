@@ -7,11 +7,15 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
+import subprocess
 from typing import Dict, List, Optional, Set, Tuple
 
 from .models import Account, AccountType, EntryLine, Transaction
 from .chart import ChartOfAccounts
 from .io import load_data_file, save_data_file
+
+# Fraction of available memory at which journal files trigger auto-persist.
+DEFAULT_PERSIST_THRESHOLD = 0.10  # 10%
 
 
 @dataclass
@@ -189,6 +193,136 @@ class Ledger:
                     bal.total_credits += line.amount
 
         return balances
+
+    # ------------------------------------------------------------------
+    # Auto-persist helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def journal_size_bytes(ledger_dir: Path) -> int:
+        """Return total byte size of all journal files under ledger_dir/journal/."""
+        journal_dir = ledger_dir / "journal"
+        if not journal_dir.exists():
+            return 0
+        return sum(
+            f.stat().st_size
+            for f in journal_dir.iterdir()
+            if f.is_file() and f.suffix in (".yaml", ".yml", ".json")
+        )
+
+    @staticmethod
+    def available_memory_bytes() -> int:
+        """Return available memory in bytes using only the standard library."""
+        try:
+            # Linux / macOS
+            import resource
+            soft, _ = resource.getrlimit(resource.RLIMIT_AS)
+            if soft > 0:
+                return soft
+        except (ImportError, AttributeError, ValueError):
+            pass
+
+        try:
+            # macOS: vm_stat
+            import subprocess as _sp
+            result = _sp.run(["vm_stat"], capture_output=True, text=True, timeout=5)
+            free_pages = 0
+            for line in result.stdout.splitlines():
+                if "Pages free" in line or "Pages inactive" in line:
+                    val = line.split(":")[-1].strip().rstrip(".")
+                    try:
+                        free_pages += int(val)
+                    except ValueError:
+                        pass
+            if free_pages:
+                return free_pages * 4096  # macOS page size
+        except Exception:
+            pass
+
+        try:
+            # Linux: /proc/meminfo
+            mem_info = Path("/proc/meminfo").read_text()
+            for line in mem_info.splitlines():
+                if line.startswith("MemAvailable:"):
+                    kb = int(line.split()[1])
+                    return kb * 1024
+        except (FileNotFoundError, ValueError, IndexError):
+            pass
+
+        # Conservative fallback: 512 MB
+        return 512 * 1024 * 1024
+
+    @staticmethod
+    def _get_git_sha(ledger_dir: Path) -> Optional[str]:
+        """Return the current HEAD SHA of the git repo containing ledger_dir."""
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=str(ledger_dir),
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if result.returncode == 0:
+                return result.stdout.strip()
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+        return None
+
+    def persist_ledger(self, git_sha: Optional[str] = None) -> Path:
+        """
+        Write a ledger-cache.yaml snapshot of all computed account balances to
+        root_dir/ledger-cache.yaml.  The file records the Git SHA of the journal
+        commit it was derived from, providing a provenance link.
+
+        This does NOT replace the ephemeral re-derive model; it is a point-in-time
+        snapshot written when journal files grow large, consistent with the session
+        log design decision.
+
+        Returns the path of the written cache file.
+        """
+        balances = self.get_balances()
+
+        snapshot: Dict = {
+            "meta": {
+                "generated": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "entity": self.entity,
+                "transaction_count": len(self.transactions),
+                "git_sha": git_sha or self._get_git_sha(self.root_dir),
+            },
+            "balances": [
+                {
+                    "code": code,
+                    "name": bal.account.name,
+                    "type": bal.account.type.value,
+                    "debit": float(bal.total_debits),
+                    "credit": float(bal.total_credits),
+                    "net": float(bal.net_balance),
+                }
+                for code, bal in sorted(balances.items())
+                if bal.total_debits or bal.total_credits
+            ],
+        }
+
+        cache_path = self.root_dir / "ledger-cache.yaml"
+        save_data_file(snapshot, cache_path)
+        return cache_path
+
+    def check_and_persist(
+        self,
+        threshold_pct: float = DEFAULT_PERSIST_THRESHOLD,
+        git_sha: Optional[str] = None,
+    ) -> Optional[Path]:
+        """
+        Measure journal file size against available memory.  If the journals
+        exceed threshold_pct of available memory, call persist_ledger() and
+        return the cache path.  Otherwise return None.
+        """
+        journal_bytes = self.journal_size_bytes(self.root_dir)
+        available = self.available_memory_bytes()
+        if journal_bytes >= available * threshold_pct:
+            return self.persist_ledger(git_sha=git_sha)
+        return None
 
     def add_transaction(self, tx: Transaction, file_path: Optional[Path] = None):
         if not tx.is_balanced:

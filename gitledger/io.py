@@ -48,11 +48,33 @@ def save_data_file(data: Any, path: Path):
         path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
-def _parse_simple_yaml(text: str) -> list:
+def _parse_simple_yaml(text: str) -> Any:
     """
-    Minimal parser for simple list-of-dicts YAML when PyYAML is not installed.
+    Minimal parser for simple YAML when PyYAML is not installed.
+
+    Handles two top-level structures:
+    - A list of dicts (``- key: value`` items) — used by journal/accounts files.
+    - A plain dict (``key: value`` or ``key:\\n  subkey: value``) — used by
+      mapping-rules files.
+
+    Nested dicts are supported up to two levels deep.  Multi-line values and
+    YAML anchors/aliases are not supported.
     """
     lines = text.splitlines()
+
+    # Determine top-level structure by looking at the first non-comment,
+    # non-empty line.
+    first_content = next(
+        (l.strip() for l in lines if l.strip() and not l.strip().startswith("#")),
+        "",
+    )
+    if first_content.startswith("- "):
+        return _parse_yaml_list(lines)
+    return _parse_yaml_dict(lines)
+
+
+def _parse_yaml_list(lines: list) -> list:
+    """Parse a top-level list-of-dicts YAML document."""
     items = []
     current_item = None
     current_list_key = None
@@ -66,7 +88,6 @@ def _parse_simple_yaml(text: str) -> list:
 
         indent = len(line) - len(line.lstrip())
 
-        # Top-level item starting with "- "
         if line.startswith("- "):
             if current_item is not None:
                 items.append(current_item)
@@ -78,7 +99,6 @@ def _parse_simple_yaml(text: str) -> list:
                 k, v = rest.split(":", 1)
                 current_item[k.strip()] = _parse_scalar(v.strip())
         elif current_item is not None:
-            # Check for sub-list item like "    - account: '1010'"
             if stripped.startswith("- "):
                 sub_rest = stripped[2:].strip()
                 current_sub_item = {}
@@ -92,7 +112,6 @@ def _parse_simple_yaml(text: str) -> list:
                 k = k.strip()
                 v = v.strip()
                 if not v:
-                    # New sublist key like "entries:"
                     current_list_key = k
                     current_item[k] = []
                 elif current_sub_item is not None and indent >= 6:
@@ -103,6 +122,77 @@ def _parse_simple_yaml(text: str) -> list:
     if current_item is not None:
         items.append(current_item)
     return items
+
+
+def _parse_yaml_dict(lines: list) -> dict:
+    """
+    Parse a top-level dict YAML document with optional one-level-deep nested
+    dicts (indented sub-keys).  Supports quoted keys to handle strings like
+    ``"Bank Service Charges": "5400"``.
+    """
+    result: dict = {}
+    current_key: str | None = None  # current top-level key whose value is a dict
+
+    for raw_line in lines:
+        line = raw_line.rstrip()
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+
+        indent = len(line) - len(line.lstrip())
+
+        # Quoted or unquoted key: value
+        if ":" in stripped:
+            # Split on first colon not inside quotes
+            colon_pos = _find_colon(stripped)
+            if colon_pos == -1:
+                continue
+            raw_k = stripped[:colon_pos].strip().strip('"').strip("'")
+            raw_v = _strip_inline_comment(stripped[colon_pos + 1:].strip()).strip('"').strip("'")
+
+            if indent == 0:
+                # Top-level key
+                if raw_v:
+                    result[raw_k] = _parse_scalar(raw_v)
+                    current_key = None
+                else:
+                    # Key with no value — nested dict follows
+                    result[raw_k] = {}
+                    current_key = raw_k
+            else:
+                # Indented — belongs to current_key's dict
+                if current_key is not None:
+                    result[current_key][raw_k] = _parse_scalar(raw_v) if raw_v else {}
+
+    return result
+
+
+def _strip_inline_comment(s: str) -> str:
+    """Remove a trailing ``# comment`` from a YAML value, respecting quotes."""
+    in_single = False
+    in_double = False
+    for i, ch in enumerate(s):
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        elif ch == "#" and not in_single and not in_double:
+            return s[:i].rstrip()
+    return s
+
+
+def _find_colon(s: str) -> int:
+    """Return index of the first colon in *s* that is not inside quotes."""
+    in_single = False
+    in_double = False
+    for i, ch in enumerate(s):
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        elif ch == ":" and not in_single and not in_double:
+            return i
+    return -1
 
 
 def _parse_scalar(val: str) -> Any:

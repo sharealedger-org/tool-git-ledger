@@ -323,3 +323,231 @@ class WaveImporter:
             except ValueError:
                 continue
         return None
+
+
+class QuickBooksImporter:
+    """
+    Imports a QuickBooks General Ledger / Transaction Detail CSV export into
+    git-ledger Transactions.
+
+    **Export format targeted:**
+    QuickBooks Desktop → Reports → Accountant & Taxes → General Ledger
+    (or Transaction Detail by Account).  Exported as CSV ("Save as Excel" then
+    save-as CSV, or use "Export to .csv" directly if available).
+
+    Expected columns (QuickBooks Desktop General Ledger CSV):
+        Type, Date, Num, Name, Memo, Account, Debit, Credit, Balance
+
+    Each row is one journal line.  Rows are grouped into transactions by (Date, Num,
+    Memo) — the combination that uniquely identifies a QB transaction in this format.
+    Any row where both Debit and Credit are empty/zero is skipped (header/subtotal rows).
+
+    **QuickBooks Online** uses a similar format but may label columns differently:
+        Transaction Type, Date, Num, Name, Memo/Description, Account, Debit, Credit
+    Both variants are handled via case-insensitive column matching.
+
+    .. note::
+        This importer was written against the documented QB General Ledger CSV
+        specification.  No live QuickBooks CSV sample was available during
+        development.  Validate against a real export before relying on it in
+        production, and adjust the ``account_mappings`` in your
+        ``qb-import.yaml`` mapping rules file as needed.
+
+    Mapping-rules YAML format (same structure as wave-import.yaml):
+        entity: <entity-name>
+        account_mappings:
+            "QuickBooks Account Name": "chart-code"
+        account_group_fallbacks:
+            Bank: "1010"
+            Accounts Receivable: "1100"
+            Accounts Payable: "2000"
+            Credit Card: "2050"
+            Equity: "3100"
+            Income: "4100"
+            Expense: "5900"
+    """
+
+    # Default fallbacks keyed on QB account type keywords
+    DEFAULT_FALLBACKS: Dict[str, str] = {
+        "bank": "1010",
+        "cash": "1010",
+        "accounts receivable": "1100",
+        "accounts payable": "2000",
+        "credit card": "2050",
+        "equity": "3100",
+        "income": "4100",
+        "revenue": "4100",
+        "expense": "5900",
+        "cost of goods sold": "5900",
+        "other income": "4900",
+        "other expense": "5900",
+    }
+
+    def __init__(self, mapping_rules_path: Path, entity: str):
+        self.entity = entity
+        self.account_mappings: Dict[str, str] = {}
+        self.group_fallbacks: Dict[str, str] = dict(self.DEFAULT_FALLBACKS)
+        if mapping_rules_path.exists():
+            self._load_rules(mapping_rules_path)
+
+    def _load_rules(self, path: Path):
+        data = load_data_file(path) or {}
+        self.account_mappings = {
+            str(k): str(v)
+            for k, v in data.get("account_mappings", {}).items()
+        }
+        self.group_fallbacks.update({
+            str(k).lower(): str(v)
+            for k, v in data.get("account_group_fallbacks", {}).items()
+        })
+
+    def resolve_account(self, qb_account_name: str) -> str:
+        """Map a QB account name to a chart code."""
+        if qb_account_name in self.account_mappings:
+            return self.account_mappings[qb_account_name]
+        # Try keyword match against fallbacks
+        lower = qb_account_name.lower()
+        for keyword, code in self.group_fallbacks.items():
+            if keyword in lower:
+                return code
+        return "5900"  # catch-all
+
+    def parse_csv(self, csv_path: Path) -> List[Transaction]:
+        """
+        Parse a QuickBooks General Ledger CSV export into balanced Transactions.
+
+        Rows are grouped by (Date, Num, Memo) into individual transactions.
+        Each group must balance (total debits == total credits); unbalanced
+        groups are returned as-is and flagged so the caller can skip or inspect.
+        """
+        groups: Dict[Tuple, List[Dict[str, str]]] = {}
+        order: List[Tuple] = []
+
+        with open(csv_path, newline="", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            # Normalise fieldnames case-insensitively
+            raw_fields = reader.fieldnames or []
+            field_map = {name.lower().strip(): name for name in raw_fields}
+
+            date_col   = field_map.get("date")
+            num_col    = field_map.get("num") or field_map.get("transaction #") or field_map.get("ref no.")
+            name_col   = field_map.get("name")
+            memo_col   = field_map.get("memo") or field_map.get("memo/description") or field_map.get("description")
+            type_col   = field_map.get("type") or field_map.get("transaction type")
+            acct_col   = field_map.get("account")
+            debit_col  = field_map.get("debit")
+            credit_col = field_map.get("credit")
+
+            if not date_col or not acct_col:
+                raise ValueError(
+                    f"Could not identify required columns (Date, Account) in: {raw_fields}"
+                )
+
+            for row in reader:
+                # Skip subtotal / header rows that have no account or no amounts
+                raw_date = row.get(date_col, "").strip()
+                raw_acct = row.get(acct_col, "").strip() if acct_col else ""
+                if not raw_date or not raw_acct:
+                    continue
+                raw_debit  = row.get(debit_col, "").strip()  if debit_col  else ""
+                raw_credit = row.get(credit_col, "").strip() if credit_col else ""
+                if not raw_debit and not raw_credit:
+                    continue
+
+                num  = row.get(num_col,  "").strip() if num_col  else ""
+                memo = row.get(memo_col, "").strip() if memo_col else ""
+                key  = (raw_date, num, memo)
+                if key not in groups:
+                    groups[key] = []
+                    order.append(key)
+                groups[key].append(dict(row))
+
+        transactions: List[Transaction] = []
+        for idx, key in enumerate(order, start=1):
+            tx = self._build_transaction(idx, key, groups[key], field_map)
+            if tx is not None:
+                transactions.append(tx)
+
+        return transactions
+
+    def _build_transaction(
+        self,
+        idx: int,
+        key: Tuple,
+        rows: List[Dict[str, str]],
+        field_map: Dict[str, str],
+    ) -> Optional[Transaction]:
+        raw_date, num, memo = key
+
+        tx_date = self._parse_date(raw_date)
+        if not tx_date:
+            return None
+
+        acct_col   = field_map.get("account", "")
+        debit_col  = field_map.get("debit", "")
+        credit_col = field_map.get("credit", "")
+        name_col   = field_map.get("name", "")
+        type_col   = field_map.get("type") or field_map.get("transaction type", "")
+
+        description = memo or (rows[0].get(type_col, "").strip() if type_col else "")
+        if name_col:
+            name = rows[0].get(name_col, "").strip()
+            if name and not description:
+                description = name
+
+        lines: List[EntryLine] = []
+        for row in rows:
+            acct_name  = row.get(acct_col, "").strip()
+            raw_debit  = row.get(debit_col,  "").replace(",", "").replace("$", "").strip() if debit_col  else ""
+            raw_credit = row.get(credit_col, "").replace(",", "").replace("$", "").strip() if credit_col else ""
+
+            chart_code = self.resolve_account(acct_name)
+
+            if raw_debit:
+                try:
+                    amt = Decimal(raw_debit)
+                    if amt > 0:
+                        lines.append(EntryLine(
+                            account=chart_code,
+                            amount=amt,
+                            is_debit=True,
+                            memo=acct_name,
+                        ))
+                except Exception:
+                    pass
+
+            if raw_credit:
+                try:
+                    amt = Decimal(raw_credit)
+                    if amt > 0:
+                        lines.append(EntryLine(
+                            account=chart_code,
+                            amount=amt,
+                            is_debit=False,
+                            memo=acct_name,
+                        ))
+                except Exception:
+                    pass
+
+        if not lines:
+            return None
+
+        tx_id = f"qb-{tx_date.strftime('%Y%m%d')}-{num or idx:03}"
+        return Transaction(
+            id=tx_id,
+            date=tx_date,
+            description=description,
+            lines=lines,
+            reference=num,
+            tags=["qb-import"],
+            entity=self.entity,
+            source_event_id=num or None,
+        )
+
+    def _parse_date(self, date_str: str) -> Optional[date]:
+        for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y", "%d/%m/%Y", "%Y/%m/%d"):
+            try:
+                return datetime.strptime(date_str, fmt).date()
+            except ValueError:
+                continue
+        return None

@@ -17,14 +17,14 @@ if __package__ is None or __package__ == "":
     from gitledger.ledger import Ledger
     from gitledger.models import AccountType, EntryLine, Transaction
     from gitledger.reports import ReportGenerator
-    from gitledger.importer import CSVBankImporter, WaveImporter
+    from gitledger.importer import CSVBankImporter, WaveImporter, QuickBooksImporter
     from gitledger.hooks import install_hook
 else:
     from .chart import ChartOfAccounts
     from .ledger import Ledger
     from .models import AccountType, EntryLine, Transaction
     from .reports import ReportGenerator
-    from .importer import CSVBankImporter, WaveImporter
+    from .importer import CSVBankImporter, WaveImporter, QuickBooksImporter
     from .hooks import install_hook
 
 
@@ -215,6 +215,81 @@ def cmd_wave_import(args):
     print(f"Wrote {written} transactions to {ledger_dir}/journal/")
 
 
+def cmd_qb_import(args):
+    """Import a QuickBooks General Ledger CSV export into an entity ledger."""
+    ledger_dir = Path(args.path).resolve()
+    csv_path = Path(args.csv_file).resolve()
+    rules_path = Path(args.rules).resolve() if args.rules else None
+
+    if not csv_path.exists():
+        print(f"Error: CSV file not found: {csv_path}", file=sys.stderr)
+        sys.exit(1)
+    if rules_path and not rules_path.exists():
+        print(f"Error: Mapping rules file not found: {rules_path}", file=sys.stderr)
+        sys.exit(1)
+
+    # rules_path may be None; QuickBooksImporter handles missing file gracefully
+    importer = QuickBooksImporter(
+        mapping_rules_path=rules_path or Path("/dev/null"),
+        entity=args.entity,
+    )
+    imported_txs = importer.parse_csv(csv_path)
+
+    balanced   = [tx for tx in imported_txs if tx.is_balanced]
+    unbalanced = [tx for tx in imported_txs if not tx.is_balanced]
+
+    print(f"Parsed {len(imported_txs)} transactions from {csv_path.name}")
+    print(f"  Balanced:   {len(balanced)}")
+    if unbalanced:
+        print(f"  Unbalanced: {len(unbalanced)} (will be skipped)")
+        for tx in unbalanced:
+            print(f"    [{tx.date}] {tx.description[:50]} | imbalance: {tx.imbalance:.2f}")
+
+    if args.dry_run:
+        for tx in balanced:
+            total = tx.lines[0].amount if tx.lines else Decimal("0")
+            print(f"  [{tx.date}] {tx.description[:50]:<50} | ${total:,.2f}")
+        print("Dry run complete. Use without --dry-run to write to ledger.")
+        return
+
+    ledger = Ledger.load(ledger_dir, entity=args.entity)
+    written = 0
+    for tx in balanced:
+        journal_path = ledger_dir / "journal" / f"{tx.date.year}.yaml"
+        ledger.add_transaction(tx, file_path=journal_path)
+        written += 1
+    print(f"Wrote {written} transactions to {ledger_dir}/journal/")
+
+
+def cmd_persist(args):
+    """Write a ledger-cache.yaml snapshot, optionally forcing regardless of threshold."""
+    target_dir = Path(args.path).resolve()
+    ledger = Ledger.load(target_dir)
+
+    if args.force:
+        cache_path = ledger.persist_ledger()
+        journal_bytes = Ledger.journal_size_bytes(target_dir)
+        print(f"Persisted ledger snapshot: {cache_path}")
+        print(f"  Transactions: {len(ledger.transactions)}")
+        print(f"  Journal size: {journal_bytes:,} bytes")
+        git_sha = Ledger._get_git_sha(target_dir)
+        if git_sha:
+            print(f"  Git SHA:      {git_sha[:12]}")
+    else:
+        cache_path = ledger.check_and_persist(
+            threshold_pct=args.threshold / 100.0
+        )
+        journal_bytes = Ledger.journal_size_bytes(target_dir)
+        available = Ledger.available_memory_bytes()
+        pct = (journal_bytes / available * 100) if available else 0
+        print(f"Journal size:    {journal_bytes:,} bytes  ({pct:.2f}% of {available:,} B available memory)")
+        print(f"Threshold:       {args.threshold}%")
+        if cache_path:
+            print(f"Threshold exceeded — persisted: {cache_path}")
+        else:
+            print("Below threshold — no snapshot written.  Use --force to write anyway.")
+
+
 def cmd_hook(args):
     repo_root = Path(args.path).resolve()
     success, msg = install_hook(repo_root)
@@ -297,6 +372,36 @@ def main():
     p_wave.add_argument("--rules", dest="rules", required=True, help="Path to wave-import.yaml mapping rules file")
     p_wave.add_argument("--dry-run", action="store_true", help="Preview without writing")
     p_wave.set_defaults(func=cmd_wave_import)
+
+    # qb-import
+    p_qb = subparsers.add_parser("qb-import", help="Import a QuickBooks General Ledger CSV export")
+    p_qb.add_argument("csv_file", help="Path to QuickBooks General Ledger CSV file")
+    p_qb.add_argument("path", nargs="?", default=".", help="Ledger directory path (entity books dir)")
+    p_qb.add_argument("--entity", dest="entity", required=True, help="Entity name (e.g. my-org)")
+    p_qb.add_argument("--rules", dest="rules", default=None,
+                      help="Path to qb-import.yaml mapping rules file (optional)")
+    p_qb.add_argument("--dry-run", action="store_true", help="Preview without writing")
+    p_qb.set_defaults(func=cmd_qb_import)
+
+    # persist
+    p_persist = subparsers.add_parser(
+        "persist",
+        help="Write a ledger-cache.yaml balance snapshot (auto or forced)",
+    )
+    p_persist.add_argument("path", nargs="?", default=".", help="Ledger directory path")
+    p_persist.add_argument(
+        "--force",
+        action="store_true",
+        help="Write snapshot unconditionally, regardless of journal size",
+    )
+    p_persist.add_argument(
+        "--threshold",
+        type=float,
+        default=10.0,
+        metavar="PCT",
+        help="Percent of available memory at which to auto-persist (default: 10)",
+    )
+    p_persist.set_defaults(func=cmd_persist)
 
     # hook
     p_hk = subparsers.add_parser("hook", help="Git hooks management")
