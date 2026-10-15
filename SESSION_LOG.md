@@ -191,3 +191,4 @@ and the year-end PDFs in `admin/financials/Accounting/2021-Year-end/`.
 - **`Transfer Clearing` (1050)** — Wave uses this for inter-entity moves; verify it nets to zero.
 - **Inter-entity matching** — LLC "Contributions to NFP" should match NFP "Received from Sharealedger LLC" via `shared_event_id` (future enhancement).
 - **Paths** — all CLI commands now target `../sharealedger-books/` not `books/`.
+- **Verify `wave-import` writes to the correct location** — the `books_dir` argument was previously smoke-tested against `books/sharealedger-llc` (a subdirectory of `git-ledger`). It now points to `../sharealedger-books/sharealedger-llc` (a sibling repo). Confirm the CLI resolves this path correctly and that journal YAML files are written into `../sharealedger-books/sharealedger-llc/journal/` before running without `--dry-run`.
