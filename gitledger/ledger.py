@@ -29,13 +29,14 @@ class AccountBalance:
 
 
 class Ledger:
-    def __init__(self, chart: ChartOfAccounts, root_dir: Optional[Path] = None):
+    def __init__(self, chart: ChartOfAccounts, root_dir: Optional[Path] = None, entity: Optional[str] = None):
         self.chart = chart
         self.root_dir = root_dir or Path.cwd()
+        self.entity = entity  # entity this ledger represents, e.g. "sharealedger-llc"
         self.transactions: List[Transaction] = []
 
     @classmethod
-    def load(cls, ledger_dir: Path) -> "Ledger":
+    def load(cls, ledger_dir: Path, entity: Optional[str] = None) -> "Ledger":
         accounts_file = ledger_dir / "accounts.yaml"
         if not accounts_file.exists():
             accounts_file = ledger_dir / "accounts.json"
@@ -45,7 +46,10 @@ class Ledger:
         else:
             chart = ChartOfAccounts.default_nonprofit()
 
-        ledger = cls(chart=chart, root_dir=ledger_dir)
+        # Infer entity name from directory name if not supplied
+        resolved_entity = entity or ledger_dir.name
+
+        ledger = cls(chart=chart, root_dir=ledger_dir, entity=resolved_entity)
         journal_dir = ledger_dir / "journal"
         if journal_dir.exists():
             for yaml_file in sorted(journal_dir.glob("*.yaml")):
@@ -56,6 +60,25 @@ class Ledger:
                 ledger.load_journal_file(json_file)
 
         return ledger
+
+    @classmethod
+    def load_consolidated(cls, books_dir: Path) -> "Ledger":
+        """Load all entity sub-ledgers under books_dir into a single consolidated ledger."""
+        consolidated = cls(chart=ChartOfAccounts.default_nonprofit(), root_dir=books_dir, entity="consolidated")
+        for entity_dir in sorted(books_dir.iterdir()):
+            if not entity_dir.is_dir() or entity_dir.name.startswith("."):
+                continue
+            entity_ledger = cls.load(entity_dir)
+            # Tag all transactions with their entity if not already set
+            for tx in entity_ledger.transactions:
+                if tx.entity is None:
+                    tx.entity = entity_ledger.entity
+            consolidated.transactions.extend(entity_ledger.transactions)
+            # Merge charts
+            for code, acc in entity_ledger.chart.accounts.items():
+                if code not in consolidated.chart.accounts:
+                    consolidated.chart.add_account(acc)
+        return consolidated
 
     def load_journal_file(self, file_path: Path):
         data = load_data_file(file_path) or []
@@ -104,6 +127,9 @@ class Ledger:
                 source_file=str(file_path.name),
                 source_line=idx,
                 metadata=item.get("metadata", {}),
+                entity=item.get("entity") or self.entity,
+                source_event_id=item.get("source_event_id"),
+                shared_event_id=item.get("shared_event_id"),
             )
             self.transactions.append(tx)
 
@@ -130,7 +156,9 @@ class Ledger:
         start_date: Optional[date] = None,
         end_date: Optional[date] = None,
         accounts: Optional[Set[str]] = None,
+        entity: Optional[str] = None,
     ) -> Dict[str, AccountBalance]:
+        """Calculate balances, optionally filtered to a specific entity."""
         balances: Dict[str, AccountBalance] = {
             code: AccountBalance(account=acc)
             for code, acc in self.chart.accounts.items()
@@ -141,6 +169,8 @@ class Ledger:
             if start_date and tx.date < start_date:
                 continue
             if end_date and tx.date > end_date:
+                continue
+            if entity and tx.entity and tx.entity != entity:
                 continue
 
             for line in tx.lines:
@@ -195,6 +225,12 @@ class Ledger:
             tx_dict["tags"] = tx.tags
         if tx.metadata:
             tx_dict["metadata"] = tx.metadata
+        if tx.entity:
+            tx_dict["entity"] = tx.entity
+        if tx.source_event_id:
+            tx_dict["source_event_id"] = tx.source_event_id
+        if tx.shared_event_id:
+            tx_dict["shared_event_id"] = tx.shared_event_id
 
         existing_data = []
         if target_path.exists():

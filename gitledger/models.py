@@ -65,6 +65,10 @@ class Transaction:
     source_file: Optional[str] = None
     source_line: Optional[int] = None
     metadata: Dict[str, str] = field(default_factory=dict)
+    # Multi-entity support
+    entity: Optional[str] = None          # e.g. "sharealedger-llc", "sharealedger-nfp"
+    source_event_id: Optional[str] = None  # original source system event ID (e.g. Wave Transaction ID)
+    shared_event_id: Optional[str] = None  # links both sides of an inter-entity event
 
     @property
     def total_debits(self) -> Decimal:

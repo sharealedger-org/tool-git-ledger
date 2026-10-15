@@ -18,8 +18,9 @@ class ReportGenerator:
         self,
         as_of_date: Optional[date] = None,
         as_markdown: bool = False,
+        entity: Optional[str] = None,
     ) -> str:
-        balances = self.ledger.get_balances(end_date=as_of_date)
+        balances = self.ledger.get_balances(end_date=as_of_date, entity=entity)
         total_debits = Decimal("0.00")
         total_credits = Decimal("0.00")
 
@@ -91,8 +92,9 @@ class ReportGenerator:
         start_date: Optional[date] = None,
         end_date: Optional[date] = None,
         as_markdown: bool = False,
+        entity: Optional[str] = None,
     ) -> str:
-        balances = self.ledger.get_balances(start_date=start_date, end_date=end_date)
+        balances = self.ledger.get_balances(start_date=start_date, end_date=end_date, entity=entity)
         
         revenue_items = []
         expense_items = []
@@ -163,9 +165,10 @@ class ReportGenerator:
         self,
         as_of_date: Optional[date] = None,
         as_markdown: bool = False,
+        entity: Optional[str] = None,
     ) -> str:
         # All historical balances up to as_of_date
-        balances = self.ledger.get_balances(end_date=as_of_date)
+        balances = self.ledger.get_balances(end_date=as_of_date, entity=entity)
         
         assets = []
         liabilities = []

@@ -17,14 +17,14 @@ if __package__ is None or __package__ == "":
     from gitledger.ledger import Ledger
     from gitledger.models import AccountType, EntryLine, Transaction
     from gitledger.reports import ReportGenerator
-    from gitledger.importer import CSVBankImporter
+    from gitledger.importer import CSVBankImporter, WaveImporter
     from gitledger.hooks import install_hook
 else:
     from .chart import ChartOfAccounts
     from .ledger import Ledger
     from .models import AccountType, EntryLine, Transaction
     from .reports import ReportGenerator
-    from .importer import CSVBankImporter
+    from .importer import CSVBankImporter, WaveImporter
     from .hooks import install_hook
 
 
@@ -71,9 +71,16 @@ def cmd_check(args):
         print(f"OK: All {len(ledger.transactions)} transactions are balanced and valid in {target_dir}.")
 
 
+def _load_ledger(path: Path, entity: Optional[str] = None) -> Ledger:
+    """Load a ledger, using consolidated load when --entity consolidated or path is a books root."""
+    if entity == "consolidated":
+        return Ledger.load_consolidated(path)
+    return Ledger.load(path, entity=entity)
+
+
 def cmd_balance(args):
     target_dir = Path(args.path).resolve()
-    ledger = Ledger.load(target_dir)
+    ledger = _load_ledger(target_dir, getattr(args, "entity", None))
     errors = ledger.validate()
     if errors and args.strict:
         print("Cannot generate report: ledger has validation errors.", file=sys.stderr)
@@ -81,24 +88,36 @@ def cmd_balance(args):
 
     as_of = parse_date(args.as_of)
     rep = ReportGenerator(ledger)
-    print(rep.trial_balance(as_of_date=as_of, as_markdown=args.md))
+    entity_filter = getattr(args, "entity", None)
+    if entity_filter and entity_filter != "consolidated":
+        print(rep.trial_balance(as_of_date=as_of, as_markdown=args.md, entity=entity_filter))
+    else:
+        print(rep.trial_balance(as_of_date=as_of, as_markdown=args.md))
 
 
 def cmd_income(args):
     target_dir = Path(args.path).resolve()
-    ledger = Ledger.load(target_dir)
+    ledger = _load_ledger(target_dir, getattr(args, "entity", None))
     rep = ReportGenerator(ledger)
     start_d = parse_date(args.from_date)
     end_d = parse_date(args.to_date)
-    print(rep.income_statement(start_date=start_d, end_date=end_d, as_markdown=args.md))
+    entity_filter = getattr(args, "entity", None)
+    if entity_filter and entity_filter != "consolidated":
+        print(rep.income_statement(start_date=start_d, end_date=end_d, as_markdown=args.md, entity=entity_filter))
+    else:
+        print(rep.income_statement(start_date=start_d, end_date=end_d, as_markdown=args.md))
 
 
 def cmd_balance_sheet(args):
     target_dir = Path(args.path).resolve()
-    ledger = Ledger.load(target_dir)
+    ledger = _load_ledger(target_dir, getattr(args, "entity", None))
     rep = ReportGenerator(ledger)
     as_of = parse_date(args.as_of)
-    print(rep.balance_sheet(as_of_date=as_of, as_markdown=args.md))
+    entity_filter = getattr(args, "entity", None)
+    if entity_filter and entity_filter != "consolidated":
+        print(rep.balance_sheet(as_of_date=as_of, as_markdown=args.md, entity=entity_filter))
+    else:
+        print(rep.balance_sheet(as_of_date=as_of, as_markdown=args.md))
 
 
 def cmd_record(args):
@@ -154,6 +173,48 @@ def cmd_import(args):
     print(f"Successfully wrote {len(imported_txs)} transactions to ledger journal.")
 
 
+def cmd_wave_import(args):
+    """Import a Wave accounting CSV export into an entity ledger."""
+    ledger_dir = Path(args.path).resolve()
+    csv_path = Path(args.csv_file).resolve()
+    rules_path = Path(args.rules).resolve()
+
+    if not csv_path.exists():
+        print(f"Error: CSV file not found: {csv_path}", file=sys.stderr)
+        sys.exit(1)
+    if not rules_path.exists():
+        print(f"Error: Mapping rules file not found: {rules_path}", file=sys.stderr)
+        sys.exit(1)
+
+    importer = WaveImporter(mapping_rules_path=rules_path, entity=args.entity)
+    imported_txs = importer.parse_csv(csv_path)
+
+    balanced = [tx for tx in imported_txs if tx.is_balanced]
+    unbalanced = [tx for tx in imported_txs if not tx.is_balanced]
+
+    print(f"Parsed {len(imported_txs)} transactions from {csv_path.name}")
+    print(f"  Balanced:   {len(balanced)}")
+    if unbalanced:
+        print(f"  Unbalanced: {len(unbalanced)} (will be skipped)")
+        for tx in unbalanced:
+            print(f"    [{tx.date}] {tx.description[:50]} | imbalance: {tx.imbalance:.2f}")
+
+    if args.dry_run:
+        for tx in balanced:
+            total = tx.lines[0].amount if tx.lines else Decimal("0")
+            print(f"  [{tx.date}] {tx.description[:50]:<50} | ${total:,.2f}")
+        print("Dry run complete. Use without --dry-run to write to ledger.")
+        return
+
+    ledger = Ledger.load(ledger_dir, entity=args.entity)
+    written = 0
+    for tx in balanced:
+        journal_path = ledger_dir / "journal" / f"{tx.date.year}.yaml"
+        ledger.add_transaction(tx, file_path=journal_path)
+        written += 1
+    print(f"Wrote {written} transactions to {ledger_dir}/journal/")
+
+
 def cmd_hook(args):
     repo_root = Path(args.path).resolve()
     success, msg = install_hook(repo_root)
@@ -187,6 +248,7 @@ def main():
     p_bal.add_argument("--as-of", dest="as_of", help="As of date (YYYY-MM-DD)")
     p_bal.add_argument("--md", action="store_true", help="Output in Markdown format")
     p_bal.add_argument("--strict", action="store_true", help="Fail if any unbalanced transaction exists")
+    p_bal.add_argument("--entity", dest="entity", help="Filter by entity (e.g. sharealedger-llc) or 'consolidated'")
     p_bal.set_defaults(func=cmd_balance)
 
     # income
@@ -195,6 +257,7 @@ def main():
     p_inc.add_argument("--from", dest="from_date", help="Start date (YYYY-MM-DD)")
     p_inc.add_argument("--to", dest="to_date", help="End date (YYYY-MM-DD)")
     p_inc.add_argument("--md", action="store_true", help="Output in Markdown format")
+    p_inc.add_argument("--entity", dest="entity", help="Filter by entity or 'consolidated'")
     p_inc.set_defaults(func=cmd_income)
 
     # balance-sheet
@@ -202,6 +265,7 @@ def main():
     p_bs.add_argument("path", nargs="?", default=".", help="Ledger directory path")
     p_bs.add_argument("--as-of", dest="as_of", help="As of date (YYYY-MM-DD)")
     p_bs.add_argument("--md", action="store_true", help="Output in Markdown format")
+    p_bs.add_argument("--entity", dest="entity", help="Filter by entity or 'consolidated'")
     p_bs.set_defaults(func=cmd_balance_sheet)
 
     # record
@@ -224,6 +288,15 @@ def main():
     p_imp.add_argument("--cash-account", default="1010", help="Cash account code (default: 1010)")
     p_imp.add_argument("--dry-run", action="store_true", help="Preview without writing")
     p_imp.set_defaults(func=cmd_import)
+
+    # wave-import
+    p_wave = subparsers.add_parser("wave-import", help="Import a Wave accounting CSV export")
+    p_wave.add_argument("csv_file", help="Path to Wave accounting.csv export file")
+    p_wave.add_argument("path", nargs="?", default=".", help="Ledger directory path (entity books dir)")
+    p_wave.add_argument("--entity", dest="entity", required=True, help="Entity name (e.g. sharealedger-llc)")
+    p_wave.add_argument("--rules", dest="rules", required=True, help="Path to wave-import.yaml mapping rules file")
+    p_wave.add_argument("--dry-run", action="store_true", help="Preview without writing")
+    p_wave.set_defaults(func=cmd_wave_import)
 
     # hook
     p_hk = subparsers.add_parser("hook", help="Git hooks management")
